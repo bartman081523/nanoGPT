@@ -10,3 +10,5 @@ __pycache__/
 input.txt
 env/
 venv/
+wikidata/latest-all.json.bz2
+wikidata/latest-truthy.nt.bz2

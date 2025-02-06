@@ -1,10 +1,16 @@
 import os
 import pickle
+import subprocess  # Import subprocess
+
+import spacy
 import numpy as np
 from tqdm import tqdm
+from spacy.tokens import Span
+
 
 class OfflineWikidataKnowledgeGraph:
     """
+    (Same OfflineWikidataKnowledgeGraph class as before - no changes here)
     Interface to an offline Wikidata subset (TSV format).
     """
     def __init__(self, tsv_path):
@@ -38,13 +44,10 @@ class OfflineWikidataKnowledgeGraph:
 
     def get_concept_id(self, concept_name):
         """
-        Placeholder for getting QID from concept name.  In an offline setting,
-        you *must* pre-extract the relevant concepts and their QIDs.  This
-        method would look up the QID in a dictionary (created during WDTK processing).
-
-        For this example, we're using the QIDs directly from the TSV.
+        Placeholder: Returns the QID. In this offline setting,
+        we are using the QIDs directly from the TSV.
         """
-        return concept_name # Return the QID itself.
+        return concept_name  # Return the QID itself
 
     def has_relation(self, concept_id1, concept_id2, relation_id=None):
         """Checks if a relation exists between two concepts."""
@@ -61,7 +64,6 @@ class OfflineWikidataKnowledgeGraph:
             return (relation_id in self.data[concept_id1] and
                     concept_id2 in self.data[concept_id1][relation_id])
 
-
     def get_related_concepts(self, concept_id, relation_id=None, limit=None):
         """Gets concepts related to a given concept."""
         related_concepts = []
@@ -74,112 +76,167 @@ class OfflineWikidataKnowledgeGraph:
                 for rel, objects in self.data[concept_id].items():
                     related_concepts.extend(objects)
         if limit:
-            return related_concepts[:limit]  #Limit output
+            return related_concepts[:limit]
         else:
             return related_concepts
 
     def get_relation_id(self, relation_name):
         """
-        Placeholder: In a real offline setup with WDTK, you'd pre-extract
-        relevant relation IDs (P-numbers) and store them in a dictionary.
-        For simplicity, we assume relation IDs are already in the TSV.
+        Placeholder
         """
         return relation_name
 
 
-def find_qids(text, kg):
+def create_wikidata_subset(dump_file, output_tsv, qid_file, java_jar_path):
     """
-    Finds QIDs in a text using string matching against Wikidata labels.
-    This is a *very* basic approach and should be improved.
-    """
-    qids = set()
-    words = text.lower().split() #Lower case
-    #Try to find multi-word concepts, from longest to shortest
-    for length in range(5, 0, -1):  # Check up to 5-word sequences
-      for i in range(len(words) - length + 1):
-        phrase = " ".join(words[i:i+length])
-        qid = kg.get_concept_id(phrase) # Use the KG
-        if qid:
-          qids.add(qid)
-    return list(qids)
-
-
-def prepare_symbolic_data(input_file, output_dir, tsv_path, dataset_name="symbolic_shakespeare"):
-    """
-    Prepares symbolic data from a text file using an offline Wikidata subset.
+    Creates the Wikidata subset using the compiled Java program.
 
     Args:
-        input_file: Path to the input text file.
-        output_dir: Directory to save the processed data.
-        tsv_path: Path to the Wikidata subset TSV file.
-        dataset_name: name of the dataset
+        dump_file: Path to the Wikidata dump file (e.g., .json.bz2).
+        output_tsv: Path to the output TSV file.
+        qid_file: Path to the file containing initial QIDs (one per line).
+        java_jar_path: Path to the compiled Java JAR file.
     """
 
+    command = [
+        "java",
+        "-jar",
+        java_jar_path,
+        dump_file,
+        output_tsv,
+        qid_file,
+    ]
+    print(f"Running Java command: {' '.join(command)}")
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        print(result.stdout)  # Print standard output from Java
+        if result.stderr:
+            print(result.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running Java command: {e}")
+        print(e.stderr)
+        exit(1) #Exit with an error, if Java programm could not run
+    except FileNotFoundError:
+        print("Error: Java not found.  Make sure Java is installed and in your PATH.")
+        exit(1)
+
+
+def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, dataset_name="symbolic_shakespeare"):
+    """
+    Prepares symbolic data, creating a Wikidata subset if needed.
+    """
+
+    qid_file = os.path.join(output_dir, "initial_qids.txt") #Temporary QID file
+    java_jar_path = os.path.join("wikidata", "wikidata-subset-creator.jar") # Relative Path
+
+    # --- 0. Create Wikidata Subset (if it doesn't exist) ---
+    if not os.path.exists(tsv_path):
+        print(f"Wikidata subset file not found: {tsv_path}")
+        # Very basic initial QID extraction using spaCy (before KG subset exists)
+        #We extract QIDs from the input file, and add them to the initial QID file.
+        print("Performing initial entity linking with spaCy to generate qids.txt...")
+        try:
+            nlp = spacy.load("en_core_web_lg")
+        except OSError:
+            print("Downloading spaCy model...")
+            spacy.cli.download("en_core_web_lg")
+            nlp = spacy.load("en_core_web_lg")
+        if "entityLinker" not in nlp.pipe_names and hasattr(nlp, "add_pipe"):
+             nlp.add_pipe("entityLinker", last=True)
+
+        with open(input_file, 'r', encoding='utf-8') as f:
+            text = f.read()
+        doc = nlp(text)
+        initial_qids = set()
+        for ent in doc.ents:
+            if ent._.kb_ents:
+                initial_qids.add(ent._.kb_ents[0][0])
+        with open(qid_file, "w", encoding="utf-8") as f:
+            for qid in initial_qids:
+                f.write(qid + "\n")
+        print(f"Initial QIDs written to {qid_file}")
+        create_wikidata_subset(wikidata_dump_path, tsv_path, qid_file, java_jar_path)  # Create the subset
+
+
+    # --- 1. Load Offline Wikidata Knowledge Graph ---
     knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path)
 
+    # --- 2. Load spaCy Model (and download if necessary) ---
+    try:
+        nlp = spacy.load("en_core_web_lg")  # Use a larger model
+    except OSError:
+        print("Downloading spaCy model...")
+        spacy.cli.download("en_core_web_lg")
+        nlp = spacy.load("en_core_web_lg")
+    if "entityLinker" not in nlp.pipe_names and hasattr(nlp, "add_pipe"):
+       nlp.add_pipe("entityLinker", last=True)
+
+    # --- 3. Load and Process Text ---
     with open(input_file, 'r', encoding='utf-8') as f:
         text = f.read()
 
-    # --- Concept and Relation Extraction (using the offline KG) ---
-    sentences = text.split('.')  # Very basic sentence splitting
-    concept_ids = []
-    relation_ids = set()
+    # --- 4. Entity Linking with spaCy ---
+    print("Performing entity linking with spaCy...")
+    doc = nlp(text)
+    concept_ids = []  # Collect QIDs (as strings)
+    relation_ids = set() #Collect Relation IDs
 
+    linked_qids = set() #Keep track of linked QIDs.
 
-    print("Extracting concepts and relations...")
-    for sentence in tqdm(sentences, desc="Processing sentences"):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
+    for ent in doc.ents:
+        if ent._.kb_ents:
+            q_id = ent._.kb_ents[0][0]  # Get top candidate QID
+            linked_qids.add(q_id)
+            # concept_ids.append(q_id) # Don't add here, add after relation extraction
 
-        # 1. Find QIDs in the sentence (very basic string matching)
-        current_sentence_qids = find_qids(sentence, knowledge_graph) # Use the helper function
+    # --- 5. Relation Extraction (using KG + adjacent linked entities) ---
+    print("Extracting relations...")
 
-        # 2. Add relations based on Wikidata subset
-        for i in range(len(current_sentence_qids) - 1):
-            qid1 = current_sentence_qids[i]
-            qid2 = current_sentence_qids[i + 1]
-            # Check for *any* relation (you can refine this)
+    sentences = text.split('.')
+    for sentence in tqdm(sentences, desc="Extracting relations per sentence"):
+        sentence_qids = []
+        sentence_doc = nlp(sentence)
+        for ent in sentence_doc.ents:
+            if ent._.kb_ents:
+                q_id = ent._.kb_ents[0][0]
+                sentence_qids.append(q_id)
+        for i in range(len(sentence_qids) - 1):
+            qid1 = sentence_qids[i]
+            qid2 = sentence_qids[i+1]
             if knowledge_graph.has_relation(qid1, qid2):
-                #Find a relation id. In a real scenario, you would iterate and check.
-                for rel_id in knowledge_graph.data.get(qid1, {}).keys():
+                for rel_id in knowledge_graph.data.get(qid1, {}).keys(): #Find relation
                     if knowledge_graph.has_relation(qid1, qid2, rel_id):
-                        relation_ids.add(rel_id) # Add to the set of relation IDs.
-                        break #Stop after finding the first relation
+                        relation_ids.add(rel_id)
+                        break
+
+        concept_ids.extend(sentence_qids) #Collect Qids in this sentence
 
 
-        concept_ids.extend(current_sentence_qids)
-
-    print(f"Extracted {len(concept_ids)} concept occurrences and {len(relation_ids)} unique relations.")
-
-
-    # --- Create Integer Mappings (stoi, itos) ---
-    stoi_concepts = {cid: i for i, cid in enumerate(sorted(list(knowledge_graph.concept_ids)))} #Use all known concept ids
+    # --- 6. Create Integer Mappings (stoi, itos) ---
+    stoi_concepts = {cid: i for i, cid in enumerate(sorted(list(knowledge_graph.concept_ids)))}
     itos_concepts = {i: cid for cid, i in stoi_concepts.items()}
 
-    stoi_relations = {rid: i for i, rid in enumerate(sorted(list(knowledge_graph.relation_ids)))} #And relation ids
+    stoi_relations = {rid: i for i, rid in enumerate(sorted(list(knowledge_graph.relation_ids)))}
     itos_relations = {i: rid for rid, i in stoi_relations.items()}
 
 
-    # --- Encode Data ---
+    # --- 7. Encode Data ---
     encoded_concept_ids = [stoi_concepts[cid] for cid in concept_ids]
 
-    # --- Split into Train/Val ---
+    # --- 8. Split into Train/Val ---
     n = len(encoded_concept_ids)
     train_data = encoded_concept_ids[:int(n*0.9)]
     val_data = encoded_concept_ids[int(n*0.9):]
 
-    # --- Export to Binary Files ---
-    train_ids = np.array(train_data, dtype=np.uint16)  # Or uint32 if needed
+    # --- 9. Export to Binary Files ---
+    train_ids = np.array(train_data, dtype=np.uint16)  # Or uint32
     val_ids = np.array(val_data, dtype=np.uint16)
     train_ids.tofile(os.path.join(output_dir, 'train.bin'))
     val_ids.tofile(os.path.join(output_dir, 'val.bin'))
-    print(f"Train data size: {len(train_data)}")
-    print(f"Validation data size: {len(val_data)}")
 
-    # --- Save Metadata ---
+    # --- 10. Save Metadata ---
     meta = {
-        'vocab_size': len(stoi_concepts),  # Concept vocab size
+        'vocab_size': len(stoi_concepts),
         'stoi': stoi_concepts,
         'itos': itos_concepts,
         'relation_stoi': stoi_relations,
@@ -187,17 +244,20 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, dataset_name="symbol
     }
     with open(os.path.join(output_dir, 'meta.pkl'), 'wb') as f:
         pickle.dump(meta, f)
+
+    print(f"Processed {len(concept_ids)} concept occurrences.")
+    print(f"Train data size: {len(train_data)}")
+    print(f"Validation data size: {len(val_data)}")
     print(f"Saved metadata to {os.path.join(output_dir, 'meta.pkl')}")
 
 
 
+
 if __name__ == '__main__':
-    # Example usage:
-    input_file = 'data/shakespeare/input.txt'  # Path to your text data
-    output_dir = 'data/symbolic_shakespeare'   # Output directory
-    tsv_path = 'data/wikidata_subset.tsv'      # *** Path to your generated TSV file ***
+    input_file = 'data/shakespeare/input.txt'
+    output_dir = 'data/symbolic_shakespeare'
+    tsv_path = os.path.join(output_dir, 'wikidata_subset.tsv')  # Output TSV
+    wikidata_dump_path = 'wikidata/latest-truthy.nt.bz2'  # *** Path to Wikidata dump ***
 
-    # Create the output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-
-    prepare_symbolic_data(input_file, output_dir, tsv_path, dataset_name="symbolic_shakespeare")
+    prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, dataset_name="symbolic_shakespeare")

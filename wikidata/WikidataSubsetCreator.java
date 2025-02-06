@@ -1,3 +1,4 @@
+// WikidataSubsetCreator.java
 import org.wikidata.wdtk.datamodel.interfaces.*;
 import org.wikidata.wdtk.dumpfiles.*;
 
@@ -7,17 +8,19 @@ import java.util.Set;
 
 public class WikidataSubsetCreator {
 
-    public static void main(String[] args) throws IOException {
-        // --- Configuration ---
-        String dumpFilePath = "/path/to/your/wikidata-dump.json.bz2"; // *** CHANGE THIS ***
-        String outputFilePath = "/path/to/your/output.tsv";        // *** CHANGE THIS ***
-        Set<String> targetConcepts = new HashSet<>();
-        // Add the QIDs you care about to targetConcepts. Example:
-        // targetConcepts.add("Q24229398"); // Example: "William Shakespeare"
-        // You'll load these QIDs in your Python script.
+    public static void main(String[] args) {
+        // --- Argument Handling ---
+        if (args.length != 3) {
+            System.err.println("Usage: java WikidataSubsetCreator <dumpFilePath> <outputFilePath> <qidFilePath>");
+            System.exit(1);
+        }
+        String dumpFilePath = args[0];
+        String outputFilePath = args[1];
+        String qidFilePath = args[2];
 
-        // --- Load target concept QIDs (from a file, for example) ---
-        String qidFilePath = "/path/to/qids.txt"; // *** CHANGE THIS *** Or load inline
+
+        // --- Load target concept QIDs ---
+        Set<String> targetConcepts = new HashSet<>();
         try (BufferedReader reader = new BufferedReader(new FileReader(qidFilePath))) {
             String line;
             while ((line = reader.readLine()) != null) {
@@ -25,23 +28,28 @@ public class WikidataSubsetCreator {
             }
         } catch (IOException e) {
             System.err.println("Error reading QID file: " + e.getMessage());
-            // If you don't want to use a file, comment out the try-catch and add QIDs directly above.
+            System.exit(1); // Exit on error
         }
 
 
-        // --- WDTK Setup ---
-        MwDumpFile dumpFile = new MwDumpFile(dumpFilePath);
-        ExampleDumpProcessingHelper dumpProcessingHelper = new ExampleDumpProcessingHelper(); // Use built-in helper
-        DumpProcessingController dumpProcessingController = new DumpProcessingController("wikidatawiki");
-        dumpProcessingController.registerEntityDocumentProcessor(
+        // --- WDTK Setup and Processing ---
+        try {
+            MwDumpFile dumpFile = new MwDumpFile(dumpFilePath);
+			DumpProcessingController dumpProcessingController = new DumpProcessingController("wikidatawiki");
+            dumpProcessingController.registerEntityDocumentProcessor(
                 new SubsetProcessor(outputFilePath, targetConcepts), null, true);
 
-        // --- Process the Dump ---
-        dumpProcessingController.processDump(dumpFile);
-        System.out.println("Finished processing Wikidata dump.");
-    }
+            // Process the Dump
+            dumpProcessingController.processDump(dumpFile);
+            System.out.println("Finished processing Wikidata dump. Output written to: " + outputFilePath);
 
-    static class SubsetProcessor implements EntityDocumentProcessor {
+        }  catch (IOException e) {
+            System.err.println("Error processing Wikidata dump: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+    //Inner class (SubsetProcessor)
+     static class SubsetProcessor implements EntityDocumentProcessor {
         private final BufferedWriter writer;
         private final Set<String> targetConcepts;
 
@@ -66,7 +74,7 @@ public class WikidataSubsetCreator {
                 //Also, scan labels to find new QIDs, and add them to targetConcepts
                 if (targetConcepts.contains(subjectQid)) {
                     for (MonolingualTextValue label : itemDocument.getLabels().values()) {
-                      String concept_id = ExampleDumpProcessingHelper.getConceptQid(label.getText()); //Use the existing method
+                      String concept_id = getConceptQid(label.getText()); //Use the existing method
                       if(concept_id != null){
                         targetConcepts.add(concept_id);
                       }
@@ -90,7 +98,7 @@ public class WikidataSubsetCreator {
 
         @Override
 		public void processLexemeDocument(LexemeDocument lexemeDocument) {
-			// Nothing to do (we don't use Lexemes in this example)
+			// Nothing to do
 		}
 
 		@Override
@@ -124,5 +132,44 @@ public class WikidataSubsetCreator {
                     }
                 }
         }
+
+
+    //Helper method to get the QID, using Wikidata online (SPARQL)
+     public String getConceptQid(String conceptName) {
+        String service = "https://query.wikidata.org/sparql";
+        String query = "SELECT ?concept WHERE { ?concept rdfs:label \"" + conceptName + "\"@en .}";
+
+        try {
+            URL url = new URL(service + "?query=" + URLEncoder.encode(query, "UTF-8") + "&format=json");
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setRequestProperty("Accept", "application/sparql-results+json");
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()))) {
+                StringBuilder response = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    response.append(line);
+                }
+
+                // Parse JSON response using a simple approach (you might use a JSON library for more robust parsing)
+                String jsonString = response.toString();
+                int start = jsonString.indexOf("value") + 9;
+                if(start >= 9){ //Check if result was found
+                    int end = jsonString.indexOf("\"", start);
+                    String conceptUri = jsonString.substring(start, end);
+                    String conceptQid = conceptUri.substring(conceptUri.lastIndexOf("/") + 1);
+                    return conceptQid;
+                }
+                else{
+                    return null; //No concept found
+                }
+
+            }
+        } catch (IOException e) {
+           System.err.println("Error during getConceptQid: " + e); //Print error
+            return null;
+        }
     }
+  }
 }
