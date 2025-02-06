@@ -1,202 +1,165 @@
 import os
 import pickle
-import requests
 import numpy as np
 from tqdm import tqdm
-from SPARQLWrapper import SPARQLWrapper, JSON
 
-class WikidataKnowledgeGraph:
+class OfflineWikidataKnowledgeGraph:
     """
-    Interface to Wikidata using SPARQL.
+    Interface to an offline Wikidata subset (TSV format).
     """
-    def __init__(self, endpoint="https://query.wikidata.org/sparql"):
-        self.sparql = SPARQLWrapper(endpoint)
-        self.sparql.setReturnFormat(JSON)
+    def __init__(self, tsv_path):
+        self.data = {}  # Store triples: {subject: {predicate: [objects]}}
+        self.concept_ids = set() #Keep track of all concepts
+        self.relation_ids = set()
+        self.load_tsv(tsv_path)
+
+
+    def load_tsv(self, tsv_path):
+        """Loads the Wikidata subset from a TSV file."""
+        print(f"Loading Wikidata subset from {tsv_path}...")
+        with open(tsv_path, 'r', encoding='utf-8') as f:
+            next(f)  # Skip header line (subject predicate object)
+            for line in tqdm(f, desc="Loading TSV"):
+                try:
+                    subject, predicate, object_ = line.strip().split('\t')
+                    self.concept_ids.add(subject)
+                    self.relation_ids.add(predicate)
+                    self.concept_ids.add(object_)
+
+                    if subject not in self.data:
+                        self.data[subject] = {}
+                    if predicate not in self.data[subject]:
+                        self.data[subject][predicate] = []
+                    self.data[subject][predicate].append(object_)
+                except ValueError:
+                    print(f"Skipping invalid line: {line.strip()}") #Handle lines that do not have 3 values.
+
+        print(f"Loaded {len(self.data)} subjects, {len(self.concept_ids)} unique concepts, and {len(self.relation_ids)} relations.")
 
     def get_concept_id(self, concept_name):
         """
-        Retrieves the Wikidata QID for a given concept name (label).
+        Placeholder for getting QID from concept name.  In an offline setting,
+        you *must* pre-extract the relevant concepts and their QIDs.  This
+        method would look up the QID in a dictionary (created during WDTK processing).
 
-        Args:
-            concept_name: The string label of the concept (e.g., "apple").
-
-        Returns:
-            The Wikidata QID (e.g., "Q89") as a string, or None if not found.
+        For this example, we're using the QIDs directly from the TSV.
         """
-        query = f"""
-        SELECT ?item ?itemLabel
-        WHERE {{
-          ?item rdfs:label "{concept_name}"@en .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-        }}
-        LIMIT 1
-        """
-        self.sparql.setQuery(query)
-        try:
-            results = self.sparql.queryAndConvert()
-            for result in results["results"]["bindings"]:
-                return result["item"]["value"].split("/")[-1]  # Extract QID
-            return None  # No results found
-        except Exception as e:
-            print(f"Error during SPARQL query: {e}")
-            return None  # Handle query errors gracefully
-
-    def get_relation_id(self, relation_name):
-      """
-      Retrieves the Wikidata PID for a given relation name
-      """
-      query = f"""
-        SELECT ?item ?itemLabel
-        WHERE {{
-          ?item rdfs:label "{relation_name}"@en .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-        }}
-        LIMIT 1
-        """
-      self.sparql.setQuery(query)
-      try:
-          results = self.sparql.queryAndConvert()
-          for result in results["results"]["bindings"]:
-              return result["item"]["value"].split("/")[-1]  # Extract PID
-          return None
-      except Exception as e:
-        print(f"SPARQL query error: {e}")
-        return None
-
+        return concept_name # Return the QID itself.
 
     def has_relation(self, concept_id1, concept_id2, relation_id=None):
-        """
-        Checks if a relation exists between two concepts in Wikidata.
-
-        Args:
-            concept_id1: The Wikidata QID of the first concept.
-            concept_id2: The Wikidata QID of the second concept.
-            relation_id:  The Wikidata PID of the relation (Property ID).  If None, *any* relation is checked.
-
-        Returns:
-            True if the relation exists, False otherwise.
-        """
-
-        if relation_id:
-             query = f"""
-                ASK {{
-                  wd:{concept_id1} wdt:{relation_id} wd:{concept_id2} .
-                }}
-            """
-        else:
+        """Checks if a relation exists between two concepts."""
+        if concept_id1 not in self.data:
+            return False
+        if relation_id is None:
             # Check for *any* relation
-            query = f"""
-               ASK {{
-                  wd:{concept_id1} ?p wd:{concept_id2} .
-                  FILTER(STRSTARTS(STR(?p), "http://www.wikidata.org/prop/direct/"))
-                }}
-            """
-        self.sparql.setQuery(query)
-        try:
-            results = self.sparql.queryAndConvert()
-            return results["boolean"]
-        except Exception as e:
-            print(f"Error during SPARQL query: {e}")
-            return False  # Handle errors: assume no relation
-
-    def get_related_concepts(self, concept_id, relation_id=None, limit=5):
-        """
-        Gets concepts related to a given concept via a specific relation or any relation.
-
-        Args:
-            concept_id: The Wikidata QID of the concept.
-            relation_id: (Optional) The Wikidata PID of the relation. If None, all relations are considered.
-            limit: Maximum number of related concepts to return.
-        Returns:
-             A list of related concept QIDs.
-        """
-
-        if relation_id:
-            query = f"""
-                SELECT ?related ?relatedLabel
-                WHERE {{
-                  wd:{concept_id} wdt:{relation_id} ?related .
-                  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-                }}
-                LIMIT {limit}
-                """
+            for rel, objects in self.data[concept_id1].items():
+                if concept_id2 in objects:
+                    return True
+            return False
         else:
-            query = f"""
-                SELECT ?related ?relatedLabel ?rel ?relLabel
-                WHERE {{
-                  wd:{concept_id} ?rel ?related.
-                  FILTER(STRSTARTS(STR(?rel), "http://www.wikidata.org/prop/direct/"))
-                  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-                }}
-                LIMIT {limit}
-                """
-        self.sparql.setQuery(query)
-        related_concepts = []
-        try:
-            results = self.sparql.queryAndConvert()
-            for result in results["results"]["bindings"]:
-                related_concepts.append(result["related"]["value"].split("/")[-1])
-            return related_concepts
-        except Exception as e:
-            print(f"Error during SPARQL: {e}")
-            return []
+            #Check for the specific relation.
+            return (relation_id in self.data[concept_id1] and
+                    concept_id2 in self.data[concept_id1][relation_id])
 
-def prepare_symbolic_data(input_file, output_dir, dataset_name="symbolic_data"):
+
+    def get_related_concepts(self, concept_id, relation_id=None, limit=None):
+        """Gets concepts related to a given concept."""
+        related_concepts = []
+        if concept_id in self.data:
+            if relation_id:
+                if relation_id in self.data[concept_id]:
+                    related_concepts.extend(self.data[concept_id][relation_id])
+            else:
+                # Get all related concepts
+                for rel, objects in self.data[concept_id].items():
+                    related_concepts.extend(objects)
+        if limit:
+            return related_concepts[:limit]  #Limit output
+        else:
+            return related_concepts
+
+    def get_relation_id(self, relation_name):
+        """
+        Placeholder: In a real offline setup with WDTK, you'd pre-extract
+        relevant relation IDs (P-numbers) and store them in a dictionary.
+        For simplicity, we assume relation IDs are already in the TSV.
+        """
+        return relation_name
+
+
+def find_qids(text, kg):
     """
-    Prepares symbolic data from a text file using Wikidata.
+    Finds QIDs in a text using string matching against Wikidata labels.
+    This is a *very* basic approach and should be improved.
+    """
+    qids = set()
+    words = text.lower().split() #Lower case
+    #Try to find multi-word concepts, from longest to shortest
+    for length in range(5, 0, -1):  # Check up to 5-word sequences
+      for i in range(len(words) - length + 1):
+        phrase = " ".join(words[i:i+length])
+        qid = kg.get_concept_id(phrase) # Use the KG
+        if qid:
+          qids.add(qid)
+    return list(qids)
+
+
+def prepare_symbolic_data(input_file, output_dir, tsv_path, dataset_name="symbolic_shakespeare"):
+    """
+    Prepares symbolic data from a text file using an offline Wikidata subset.
 
     Args:
         input_file: Path to the input text file.
         output_dir: Directory to save the processed data.
-        dataset_name: name of the dataset (train and val split).
+        tsv_path: Path to the Wikidata subset TSV file.
+        dataset_name: name of the dataset
     """
-    knowledge_graph = WikidataKnowledgeGraph()
+
+    knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path)
 
     with open(input_file, 'r', encoding='utf-8') as f:
         text = f.read()
 
-    # --- Concept and Relation Extraction (using Wikidata) ---
-    sentences = text.split('.')  # Very basic sentence splitting.
+    # --- Concept and Relation Extraction (using the offline KG) ---
+    sentences = text.split('.')  # Very basic sentence splitting
     concept_ids = []
     relation_ids = set()
-    all_concepts = set()  #Keep track of all concepts for creating stoi/itos
-    all_relations = set()
+
 
     print("Extracting concepts and relations...")
     for sentence in tqdm(sentences, desc="Processing sentences"):
-        words = sentence.strip().split()  # Basic tokenization
-        current_sentence_concepts = []
+        sentence = sentence.strip()
+        if not sentence:
+            continue
 
-        for word in words:
-            concept_id = knowledge_graph.get_concept_id(word.lower())
-            if concept_id:
-                current_sentence_concepts.append(concept_id)
-                all_concepts.add(concept_id) #Add to overall concept list
+        # 1. Find QIDs in the sentence (very basic string matching)
+        current_sentence_qids = find_qids(sentence, knowledge_graph) # Use the helper function
 
-        # Simple relation extraction (look for adjacent concepts in Wikidata)
-        # This part is crucial and can be significantly improved using more context
-        for i in range(len(current_sentence_concepts) - 1):
-            concept1 = current_sentence_concepts[i]
-            concept2 = current_sentence_concepts[i + 1]
-            for rel_name in ["part of", "has part", "instance of", "subclass of", "located in", "member of"]: #Examples
-               rel_id = knowledge_graph.get_relation_id(rel_name)
-               if rel_id:
-                  all_relations.add(rel_id)
-                  if knowledge_graph.has_relation(concept1, concept2, rel_id):
-                        # Collect relations, if needed.
-                        relation_ids.add(rel_id)
-                        break #Stop at the first found relation
+        # 2. Add relations based on Wikidata subset
+        for i in range(len(current_sentence_qids) - 1):
+            qid1 = current_sentence_qids[i]
+            qid2 = current_sentence_qids[i + 1]
+            # Check for *any* relation (you can refine this)
+            if knowledge_graph.has_relation(qid1, qid2):
+                #Find a relation id. In a real scenario, you would iterate and check.
+                for rel_id in knowledge_graph.data.get(qid1, {}).keys():
+                    if knowledge_graph.has_relation(qid1, qid2, rel_id):
+                        relation_ids.add(rel_id) # Add to the set of relation IDs.
+                        break #Stop after finding the first relation
 
-        concept_ids.extend(current_sentence_concepts)  # Add concepts from the current sentence.
 
-    print(f"Extracted {len(concept_ids)} concept occurrences, {len(all_concepts)} unique concepts, and {len(relation_ids)} unique relations.")
+        concept_ids.extend(current_sentence_qids)
 
-     # --- Create Integer Mappings (stoi, itos) ---
-    stoi_concepts = {cid: i for i, cid in enumerate(sorted(list(all_concepts)))}
+    print(f"Extracted {len(concept_ids)} concept occurrences and {len(relation_ids)} unique relations.")
+
+
+    # --- Create Integer Mappings (stoi, itos) ---
+    stoi_concepts = {cid: i for i, cid in enumerate(sorted(list(knowledge_graph.concept_ids)))} #Use all known concept ids
     itos_concepts = {i: cid for cid, i in stoi_concepts.items()}
 
-    stoi_relations = {rid: i for i, rid in enumerate(sorted(list(all_relations)))}
+    stoi_relations = {rid: i for i, rid in enumerate(sorted(list(knowledge_graph.relation_ids)))} #And relation ids
     itos_relations = {i: rid for rid, i in stoi_relations.items()}
+
 
     # --- Encode Data ---
     encoded_concept_ids = [stoi_concepts[cid] for cid in concept_ids]
@@ -229,11 +192,12 @@ def prepare_symbolic_data(input_file, output_dir, dataset_name="symbolic_data"):
 
 
 if __name__ == '__main__':
-    # Example usage (assuming you have an 'input.txt' file):
-    input_file = 'data/shakespeare/input.txt' # Use your data
-    output_dir = 'data/symbolic_shakespeare' #Example
+    # Example usage:
+    input_file = 'data/shakespeare/input.txt'  # Path to your text data
+    output_dir = 'data/symbolic_shakespeare'   # Output directory
+    tsv_path = 'data/wikidata_subset.tsv'      # *** Path to your generated TSV file ***
 
     # Create the output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    prepare_symbolic_data(input_file, output_dir, dataset_name = "symbolic_shakespeare")
+    prepare_symbolic_data(input_file, output_dir, tsv_path, dataset_name="symbolic_shakespeare")
