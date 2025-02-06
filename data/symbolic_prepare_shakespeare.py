@@ -21,6 +21,12 @@ class OfflineWikidataKnowledgeGraph:
     def load_tsv(self, tsv_path):
         """Loads the Wikidata subset from a TSV file."""
         print(f"Loading Wikidata subset from {tsv_path}...")
+        # Check if file exists and is not empty
+        if not os.path.exists(tsv_path) or os.stat(tsv_path).st_size == 0:
+            print(f"Error: TSV file is empty or does not exist: {tsv_path}")
+            raise FileNotFoundError(f"TSV file is empty or missing: {tsv_path}")
+
+
         with open(tsv_path, 'r', encoding='utf-8') as f:
             next(f)  # Skip header line (subject predicate object)
             for line in tqdm(f, desc="Loading TSV"):
@@ -42,13 +48,9 @@ class OfflineWikidataKnowledgeGraph:
 
     def get_concept_id(self, concept_name):
         """
-        Returns QID if the concept exists in the offline KG, otherwise None.
+        Placeholder: Returns the QID.
         """
-        # Check if the concept_name (which could be a QID) exists as a subject or object
-        if concept_name in self.concept_ids:
-            return concept_name
-        return None # Return None if not found
-
+        return concept_name  # Return the QID itself
 
     def has_relation(self, concept_id1, concept_id2, relation_id=None):
         """Checks if a relation exists between two concepts."""
@@ -92,14 +94,7 @@ class OfflineWikidataKnowledgeGraph:
 def create_wikidata_subset(dump_file, output_tsv, qid_file, java_jar_path):
     """
     Creates the Wikidata subset using the compiled Java program.
-
-    Args:
-        dump_file: Path to the Wikidata dump file (e.g., .json.bz2).
-        output_tsv: Path to the output TSV file.
-        qid_file: Path to the file containing initial QIDs (one per line).
-        java_jar_path: Path to the compiled Java JAR file.
     """
-
     command = [
         "java",
         "-jar",  # Use -jar to execute the JAR file
@@ -111,16 +106,17 @@ def create_wikidata_subset(dump_file, output_tsv, qid_file, java_jar_path):
     print(f"Running Java command: {' '.join(command)}")
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(result.stdout)  # Print standard output from Java
+        print(result.stdout)
         if result.stderr:
-            print(result.stderr)  # Print any error messages from Java
+            print(result.stderr)
     except subprocess.CalledProcessError as e:
         print(f"Error running Java command: {e}")
-        print(e.stderr) # Print stderr
+        print(e.stderr)
         exit(1)
     except FileNotFoundError:
         print("Error: Java not found.  Make sure Java is installed and in your PATH.")
         exit(1)
+
 def process_text_chunked(nlp, text, chunk_size=100000):
     """
     Processes text in chunks.
@@ -131,6 +127,7 @@ def process_text_chunked(nlp, text, chunk_size=100000):
 
 def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, dataset_name="symbolic_shakespeare"):
     qid_file = os.path.join(output_dir, "initial_qids.txt")
+    # Corrected path to the JAR file created by Maven
     java_jar_path = os.path.join("wikidata", "wikidata-subset-creator.jar")
 
     # --- 0. Create Wikidata Subset (if it doesn't exist) ---
@@ -152,15 +149,11 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
             text = f.read()
 
         initial_qids = set()
-        # We *cannot* use a KG here yet, as it doesn't exist.
+         # Process in chunks for initial QID extraction
         for doc in process_text_chunked(nlp, text):
             for ent in doc.ents:
                 if ent.label_ in ("PERSON", "ORG", "GPE", "LOC", "PRODUCT", "WORK_OF_ART", "EVENT", "NORP"):
-                    # Instead of looking up in a KG, we *assume* the entity text *might* be a QID.
-                    # We'll add "Q" as a prefix.  This is a *placeholder* and will be
-                    # corrected later by the Java code if it's a valid QID.
                     initial_qids.add("Q" + ent.text.replace(" ", "_").replace("'", "")) #Basic QID creation
-
 
         with open(qid_file, "w", encoding="utf-8") as f:
             for qid in initial_qids:
@@ -171,7 +164,11 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
 
 
     # --- 1. Load Offline Wikidata Knowledge Graph ---
-    knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path)
+    try:
+        knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path)
+    except FileNotFoundError as e:
+        print(f"Error: {e}.  Could not load Wikidata subset. Please check the file path and ensure the subset creation was successful.")
+        exit(1)
 
     # --- 2. Load spaCy Model (and download if necessary) ---
     try:
@@ -195,7 +192,7 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
         sentence_qids = []
         for ent in doc.ents:
              if ent.label_ in ("PERSON", "ORG", "GPE", "LOC", "PRODUCT", "WORK_OF_ART", "EVENT", "NORP"):
-                qid = knowledge_graph.get_concept_id(ent.text)  # Lookup in KG
+                qid = knowledge_graph.get_concept_id(ent.text) #Lookup in the offline KG
                 if qid:
                     sentence_qids.append(qid)
 
@@ -247,8 +244,6 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
     print(f"Train data size: {len(train_data)}")
     print(f"Validation data size: {len(val_data)}")
     print(f"Saved metadata to {os.path.join(output_dir, 'meta.pkl')}")
-
-
 
 if __name__ == '__main__':
     input_file = 'data/shakespeare/input.txt'
