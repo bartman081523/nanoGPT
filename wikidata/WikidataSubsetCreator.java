@@ -5,6 +5,10 @@ import org.wikidata.wdtk.dumpfiles.*;
 import java.io.*;
 import java.util.HashSet;
 import java.util.Set;
+// Add these imports:
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.net.URLEncoder;
 
 public class WikidataSubsetCreator {
 
@@ -34,8 +38,8 @@ public class WikidataSubsetCreator {
 
         // --- WDTK Setup and Processing ---
         try {
-            MwDumpFile dumpFile = new MwDumpFile(dumpFilePath);
-			DumpProcessingController dumpProcessingController = new DumpProcessingController("wikidatawiki");
+            MwDumpFile dumpFile = new MwLocalDumpFile(dumpFilePath); // Use MwLocalDumpFile
+            DumpProcessingController dumpProcessingController = new DumpProcessingController("wikidatawiki");
             dumpProcessingController.registerEntityDocumentProcessor(
                 new SubsetProcessor(outputFilePath, targetConcepts), null, true);
 
@@ -90,25 +94,24 @@ public class WikidataSubsetCreator {
             }
         }
 
-        @Override
+
         public void processPropertyDocument(PropertyDocument propertyDocument) {
             // In this example we are not storing properties separately
-            //We could do it if needed.
         }
 
-        @Override
+
 		public void processLexemeDocument(LexemeDocument lexemeDocument) {
 			// Nothing to do
 		}
 
-		@Override
+
 		public void processFormDocument(FormDocument formDocument) {
-			// Nothing to do
+			// Nothing to do in this example
 		}
 
-		@Override
+
 		public void processSenseDocument(SenseDocument senseDocument) {
-			// Nothing to do
+			// Nothing to do in this example
 		}
 
         //Helper to write statements
@@ -127,7 +130,7 @@ public class WikidataSubsetCreator {
                             } else if (value instanceof StringValue){ //String values (e.g. for labels)
                                 String objectString = ((StringValue) value).getString();
                                 writer.write(subjectQid + "\t" + propertyId + "\t" + objectString + "\n");
-                            } //else: Other types of values (e.g., quantities, dates) - handle as needed
+                            } //else: Other types of values
                         }
                     }
                 }
