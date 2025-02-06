@@ -1,0 +1,6 @@
+torch
+SPARQLWrapper
+numpy
+tqdm
+requests
+tiktoken

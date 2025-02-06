@@ -1,21 +1,3 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
 import os
 import time
 import math
@@ -27,51 +9,60 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, ReasoningState  # Import ReasoningState
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out'
+# Configuration (can be overridden by config files or command line)
+out_dir = 'out-symbolic'
 eval_interval = 2000
-log_interval = 1
+log_interval = 10
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+eval_only = False
+always_save_checkpoint = True
+init_from = 'scratch'  # 'scratch', 'resume', or 'gpt2*'
+
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = False
+wandb_project = 'symbolic-reasoning'
+wandb_run_name = 'lcm-gpt'
+
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+dataset = 'symbolic_shakespeare'  # Or your custom symbolic dataset
+gradient_accumulation_steps = 4
+batch_size = 16
+block_size = 64  # Max concept sequence length
+
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+n_layer = 6
+n_head = 4
+n_embd = 128
+dropout = 0.1
+bias = False
+concept_vocab_size = 1000  # Replace with actual size from meta.pkl
+
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+learning_rate = 1e-3
+max_iters = 10000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 1.0
+
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+decay_lr = True
+warmup_iters = 200
+lr_decay_iters = max_iters
+min_lr = 1e-4
+
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+backend = 'nccl'
+device = 'cuda'
+dtype = 'bfloat16'
+compile = True
+
+# LCM Specific
+consistency_steps = 3
+lcm_loss_weight = 0.5
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -113,22 +104,57 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+# --- Data Loading (Modified for Symbolic Data and Action Targets) ---
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
+     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+
+    # Instead of block_size, we now use a variable-length sequence of concept IDs.
+    # We'll still use a maximum sequence length for batching.
+    max_seq_len = block_size  # Or a different value, if needed
+    ix = torch.randint(len(data) - max_seq_len - consistency_steps, (batch_size,)) # Leave space for future states
+    x = torch.stack([torch.from_numpy((data[i:i+max_seq_len]).astype(np.int64)) for i in ix])
+
+     #Create target as action_ids, targets are now action_ids from the rule-based system
+    targets = []
+    for i in ix:
+        state = ReasoningState(knowledge_graph=knowledge_graph) #Pass the KG
+        temp_targets = [] # collect action ids for consistency_steps
+        for j in range(consistency_steps):
+            current_concept_ids = [data[i + j].item()] #Get current concept
+            # Use your rule-based system here to determine the action (Simplified)
+            # In reality, this would involve calling state.transition() and getting the action.
+            action_id = rule_based_transition(state, current_concept_ids) # You'll need to implement this
+            temp_targets.append(action_id)
+            state.transition(current_concept_ids, action_id=action_id, knowledge_graph=knowledge_graph) # Advance the state. Pass the action_id
+        targets.append(torch.tensor(temp_targets, dtype=torch.long)) #Append only the action_ids
+    targets = torch.stack(targets)
+
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, targets = x.pin_memory().to(device, non_blocking=True), targets.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x, targets = x.to(device), targets.to(device)
+    return x, targets
+
+# --- Rule-Based Transition Function (with Knowledge Graph Access) ---
+def rule_based_transition(state, concept_ids):
+    """
+    Implements the rule-based state transition logic.  This is a simplified
+    example and should be customized based on your specific reasoning rules
+    and knowledge graph.
+    """
+    #For simplicity: 0 = add concept, 1 = add relation (if possible), 2 = no-op
+    if not state.concepts:
+        return 0 #Add the very first concept
+    for concept_id in concept_ids:
+        if state.knowledge_graph.get_related_concepts(itos[concept_id]):
+            return 1 #Add relation, if possible
+    return 2 #No-op
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -141,11 +167,23 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
+    stoi = meta['stoi']
+    itos = meta['itos']
+    relation_stoi = meta['relation_stoi']
+    relation_itos = meta['relation_itos']
+    num_actions = len(relation_stoi) + 1 #Number of relations + 1 (for no-op or adding concept)
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print(f"Number of actions: {num_actions}")
 
-# model init
+#Define Knowledge Graph (for use in rule_based_transition and ReasoningState)
+from data.symbolic_prepare import WikidataKnowledgeGraph
+knowledge_graph = WikidataKnowledgeGraph()
+
+
+# --- Model Initialization (Modified) ---
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=meta_vocab_size, dropout=dropout, num_actions=num_actions)  # Use concept_vocab_size and num_actions
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -155,6 +193,7 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -163,7 +202,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'num_actions']: #Added num_actions
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -178,14 +217,12 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
 elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+    #Removed gpt-2 initialization.
+
+    print(f"Initializing from OpenAI GPT-2 weights: {init_from} is not supported")
+    exit()
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -211,17 +248,71 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+# --- Loss Function (LCM-Inspired) ---
+
+def lcm_loss(logits, targets, consistency_steps, lcm_loss_weight):
+    """
+    Calculates the LCM loss, including both direct prediction and consistency.
+
+    Args:
+        logits: Model output logits (batch_size, sequence_length, num_actions).
+        targets: Target action IDs (batch_size, consistency_steps).
+        consistency_steps: Number of future steps for consistency.
+        lcm_loss_weight: Weight of the consistency loss.
+
+    Returns:
+        Total loss (scalar).
+    """
+
+    batch_size, seq_len, num_actions = logits.size()
+    total_loss = 0.0
+
+    # 1. Direct Prediction Loss (Cross-Entropy)
+    direct_loss = F.cross_entropy(logits[:, 0, :], targets[:, 0], ignore_index=-1)  # Compare first prediction to first target
+    total_loss += direct_loss
+
+    # 2. Consistency Loss (KL Divergence or Cross-Entropy)
+    consistency_loss = 0.0
+    for step in range(1, consistency_steps):
+      #  consistency_loss += F.cross_entropy(logits[:, step, :], targets[:,step], ignore_index=-1) #Option 1: Cross Entropy
+        # Option 2: KL Divergence (requires converting logits to probabilities)
+        prev_probs = F.softmax(logits[:, step - 1, :], dim=-1)
+        curr_probs = F.softmax(logits[:, step, :], dim=-1)
+        consistency_loss += F.kl_div(curr_probs.log(), prev_probs, reduction='batchmean') #Compare probability distributions
+
+    total_loss += lcm_loss_weight * (consistency_loss / (consistency_steps -1))
+
+    return total_loss
+
+
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
+    """
+    Estimates the loss over the entire train/val sets.  Adapted for the
+    symbolic reasoning setup.
+    """
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
+            # Forward pass (similar to training loop, but without backprop)
             with ctx:
-                logits, loss = model(X, Y)
+                initial_state = ReasoningState(knowledge_graph=knowledge_graph)  # Start with an empty state
+                action_ids, _ = model(initial_state, targets=Y[:,0]) # first action
+                logits = torch.zeros((Y.size(0), consistency_steps, num_actions), device = device) #Dummy logit tensor with correct shape.
+                logits[:,0,:] = action_ids
+                # Get multiple steps
+                for step in range(1, consistency_steps):
+                     #Simulate state transition
+                    for i in range(action_ids.size(0)):
+                        rule_based_transition(initial_state, [X[i,step-1].item()]) #Transition
+                    next_action_ids, _ = model(initial_state)
+                    logits[:, step, :] = next_action_ids
+                loss = lcm_loss(logits, Y, consistency_steps, lcm_loss_weight)  # Use the LCM loss
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -261,7 +352,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses = estimate_loss()  # You'll need to adapt estimate_loss() too
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -297,12 +388,24 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+            # Forward pass now takes the ReasoningState
+            initial_state = ReasoningState(knowledge_graph=knowledge_graph) # Start with a fresh state each time. Pass the knowledge graph
+            action_ids, _ = model(initial_state, targets=Y[:,0]) #Predict the first action
+            logits = torch.zeros((Y.size(0), consistency_steps, num_actions), device = device) #Dummy logit tensor with correct shape.
+            logits[:,0,:] = action_ids #Store the first action
+            # Get multiple steps for consistency loss
+            for step in range(1, consistency_steps):
+                 #Simulate state transition using the RULE-BASED system
+                for i in range(action_ids.size(0)): #Iterate over batch
+                    rule_based_transition(initial_state, [X[i,step-1].item()]) #Transition to get to next state, using concept from original input X.
+                next_action_ids, _ = model(initial_state) #Predict next action
+                logits[:, step, :] = next_action_ids #Store the predicted action
+
+            loss = lcm_loss(logits, Y, consistency_steps, lcm_loss_weight)
+            loss = loss / gradient_accumulation_steps
+        X, Y = get_batch('train') #Load next batch
         scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -322,7 +425,7 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)  # Needs to be adapted
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1

@@ -1,0 +1,53 @@
+# config for training a symbolic reasoning model (LCM-inspired)
+
+out_dir = 'out-symbolic'
+eval_interval = 2000
+log_interval = 10
+eval_iters = 200  # Number of iterations to use for evaluation
+eval_only = False  # If True, only run evaluation and exit
+always_save_checkpoint = True  # Always save a checkpoint after evaluation
+init_from = 'scratch'  # 'scratch' or 'resume'.  GPT-2 initialization removed.
+
+# wandb logging
+wandb_log = True  # Enable Weights & Biases logging
+wandb_project = 'symbolic-reasoning'  # W&B project name
+wandb_run_name = 'lcm-gpt'  # W&B run name
+
+# data
+dataset = 'symbolic_shakespeare'  # Name of your symbolic dataset
+gradient_accumulation_steps = 4   # Effective batch size multiplier
+batch_size = 16 # Batch Size
+block_size = 64  # Maximum sequence length of *concepts*
+
+# model
+n_layer = 6  # Number of Transformer layers
+n_head = 4   # Number of attention heads
+n_embd = 128  # Embedding dimension
+dropout = 0.1 # Dropout
+bias = False  # Use bias in Linear and LayerNorm layers
+# concept_vocab_size is automatically loaded from meta.pkl
+# num_actions is automatically determined in train.py
+
+# adamw optimizer
+learning_rate = 1e-3  # Initial learning rate
+max_iters = 10000    # Total number of training iterations
+weight_decay = 1e-1   # Weight decay for AdamW
+beta1 = 0.9          # AdamW beta1
+beta2 = 0.95         # AdamW beta2
+grad_clip = 1.0      # Gradient clipping value (0.0 to disable)
+
+# learning rate decay settings
+decay_lr = True       # Use learning rate decay
+warmup_iters = 200    # Number of warmup iterations
+lr_decay_iters = max_iters  # Number of iterations for LR decay
+min_lr = 1e-4        # Minimum learning rate
+
+# DDP settings
+backend = 'nccl'      # Distributed backend ('nccl', 'gloo', etc.)
+device = 'cuda'       # Device to use ('cuda', 'cpu', 'mps', etc.)
+dtype = 'bfloat16'    # Data type ('float32', 'bfloat16', 'float16')
+compile = True        # Use torch.compile (requires PyTorch 2.0+)
+
+# LCM Specific
+consistency_steps = 3  # Number of future steps for consistency loss
+lcm_loss_weight = 0.5  # Weight of the consistency loss
