@@ -4,3 +4,4 @@ numpy
 tqdm
 requests
 tiktoken
+spacy
