@@ -7,3 +7,4 @@ tiktoken
 spacy
 ijson
 rdflib
+wandb

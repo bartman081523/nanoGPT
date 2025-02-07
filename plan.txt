@@ -1,0 +1,210 @@
+Okay, let's recap the entire plan, from the initial concept to the current state, and outline the next steps. We've made significant progress on the data preparation, and now we'll focus on integrating that with the model and training.
+
+Original Goal:
+
+Create a language model (based on nanoGPT) capable of internal, symbolic reasoning, inspired by the Meta-Prompt concept. We want the model to move beyond simple token-level processing and operate on a more abstract, conceptual level. We discussed using LCM (Latent Consistency Models) principles to improve training efficiency.
+
+Overall Plan (Phased Approach):
+
+Here's the original plan, with updates reflecting our current progress and the refined approach (using pure Python for data processing, and focusing on rule-based transitions initially):
+
+Phase 1: Symbolic Representation and Basic State Transition (Complete)
+
+    Concept Extraction (Beyond Tokenization): (Complete)
+
+        Goal: Replace subword tokenization with a representation of higher-level concepts.
+
+        Method: We are using spaCy for Named Entity Recognition (NER) to identify potential concepts, combined with an offline Wikidata subset (TSV file) for disambiguation and relation extraction.
+
+        Implementation: The data/symbolic_prepare_shakespeare.py script handles this. It creates train.bin and val.bin files containing concept IDs (represented as integers, mapped from Wikidata QIDs), and a meta.pkl file storing the mappings. It supports both .json.bz2 and .nt.bz2 Wikidata dump formats.
+
+    State Representation: (Complete)
+
+        Goal: Define the structure of the internal reasoning state.
+
+        Implementation: The ReasoningState class in model.py represents the state. It includes:
+
+            concepts: A set of currently active concept IDs.
+
+            relations: A list of tuples representing relationships between concepts (subject, predicate, object).
+
+            working_memory: A list (acting as a FIFO queue) to hold recently processed concepts.
+
+            knowledge_graph: A reference to the loaded OfflineWikidataKnowledgeGraph object.
+
+    Basic State Transition Function: (Complete)
+
+        Goal: Define how the state changes based on input concepts and actions.
+
+        Implementation: The transition method in the ReasoningState class. Currently, this is rule-based:
+
+            Action 0 (Add Concept): Adds a new concept to the concepts set and the working_memory.
+
+            Action 1 (Add Relation): If a relationship exists between the new concept and an existing concept (according to the loaded Wikidata subset), add it to the relations list.
+
+            Action 2 (No-op): Does nothing.
+
+            Working Memory Management: The working_memory is a fixed-size FIFO queue.
+
+Phase 2: Integrating with the Transformer and Learning Transitions (Partially Complete)
+
+    Transformer Input Modification: (Complete)
+
+        Goal: Adapt the Transformer to operate on the ReasoningState.
+
+        Implementation: The GPT.forward method in model.py now:
+
+            Takes a ReasoningState object as input.
+
+            Embeds concept IDs from the reasoning_state.working_memory.
+
+            Uses a separate embedding matrix (wte) for concepts (distinct from token embeddings).
+
+            Includes positional encoding.
+
+    Transformer Output Modification: (Complete)
+
+        Goal: Make the Transformer's output control the state transition.
+
+        Implementation: The GPT.lm_head now outputs logits over actions (0, 1, or 2 in our current setup), not over vocabulary tokens. The forward method returns these action logits. During inference, argmax is used to select the most likely action. During training, we use cross-entropy loss.
+
+    Learning the Transition Function (LCM-Inspired): (Partially Complete: Training loop is done, but needs more refinement and proper evaluation.)
+
+        Goal: Learn the state transition function from data, inspired by LCM principles.
+
+        Implementation (Current):
+
+            Training Data: The train.py script generates training data by:
+
+                Loading concept ID sequences from the .bin files.
+
+                Using the rule-based transition function to generate a sequence of ReasoningState objects and corresponding target actions.
+
+                Training data consists of pairs: (ReasoningState, target_action).
+
+            Loss Function: We're using a cross-entropy loss between the predicted action logits and the target actions derived from the rule-based system. We've implemented a consistency loss as described in the plan.
+
+            Consistency Training: The train.py script includes the LCM-inspired consistency loss. This encourages the model to make consistent predictions across multiple steps.
+
+        Implementation (Needs Further Work):
+
+            Hyperparameter Tuning: We need to tune the hyperparameters related to the LCM loss (e.g., the weight of the consistency loss).
+
+            Curriculum Learning: We might want to start with shorter consistency steps and gradually increase the number of steps as training progresses.
+
+            Evaluation Metrics: We need to define specific metrics to evaluate how well the model is learning the transition function (see Phase 3).
+
+Phase 3: Refinement and Evaluation (Next Steps)
+
+    Iterative Improvement:
+
+        Experiment with Rule-Based Systems: The current rule-based system is very simple. Try more sophisticated rules, perhaps incorporating more context from the relations already in the state.
+
+        Transformer Architectures: Explore different ways to incorporate the relations into the Transformer's input. For example, you could:
+
+            Concatenate relation embeddings with concept embeddings.
+
+            Use a separate attention mechanism to attend to relevant relations.
+
+            Experiment with different numbers of layers, heads, and embedding dimensions for the Transformer.
+
+        Hyperparameter Tuning: Systematically tune all the hyperparameters, including learning rate, batch size, dropout, network size, and LCM-related parameters.
+
+    Evaluation: (This is the most challenging and important part)
+
+        Qualitative Evaluation:
+
+            Inspect State Transitions: During training and after training, print out the ReasoningState at each step and the actions taken by the model. Examine whether the state transitions make sense given the input concepts and the learned rules.
+
+            Visualize: Develop visualizations of the concepts and relations in the state to help understand what the model is learning.
+
+        Quantitative Evaluation:
+
+            Action Prediction Accuracy: Measure how accurately the model predicts the correct action (as determined by the rule-based system) on a held-out validation set. This is a basic measure of how well the model is learning the rules.
+
+            Consistency Metrics: Quantify the consistency of the model's predictions across multiple steps. For example, if the model predicts action A at step 1 and action B at step 2, does it also predict the combined effect of A and B if asked to predict two steps ahead?
+
+            Task-Based Evaluation (Long-Term Goal): The ultimate test is whether the symbolic reasoning capability improves performance on a downstream task. This is the most challenging aspect and requires defining a suitable task. Examples might include:
+
+                Question Answering: Design questions that require reasoning over the extracted concepts and relations.
+
+                Text Summarization: Can the model generate more coherent summaries by leveraging the symbolic representation?
+
+                Story Completion: Can the model predict the next event in a story based on the inferred relationships between characters and events?
+
+            Comparison to Rule-Based System: Compare the model with only rules.
+
+Current Status Summary and Next Steps:
+
+    Data Preparation: Complete and robust (pure Python, handles both JSON and NTriples).
+
+    Model Architecture: Complete (modified GPT to handle ReasoningState).
+
+    Training Loop: Partially complete (basic training loop with cross-entropy loss and consistency loss is implemented, but needs further refinement).
+
+    Evaluation: Not implemented.
+
+    Rule-based system: Very basic.
+
+Immediate Next Steps:
+
+    Run Experiments: Get the current code running with a small dataset (e.g., using latest-truthy or a small custom JSON dump) and verify that training proceeds without errors.
+
+    Implement Basic Evaluation: Add code to train.py to calculate and print the action prediction accuracy on the validation set. This is a crucial first step for evaluating the model.
+
+    Refine Rule-Based System: Improve the rule_based_transition function in model.py. Start by adding more sophisticated rules for relation inference. For example, consider rules like:
+
+        If concept A is a "PERSON" and concept B is a "WORK_OF_ART", and a relation like "AUTHOR_OF" exists in your knowledge graph, infer that relationship.
+
+        Implement rules that use more context (e.g., not just adjacent concepts, but concepts within a certain window in the working_memory).
+
+    Hyperparameter Tuning: Once you have basic training and evaluation working, start experimenting with hyperparameters:
+
+        learning_rate
+
+        batch_size
+
+        n_layer, n_head, n_embd
+
+        consistency_steps, lcm_loss_weight
+
+    Visualize and Inspect: Add logging and visualization to your training loop to inspect the ReasoningState at each step. This is essential for understanding what the model is learning and for debugging.
+
+
+
+
+Refined Plan
+1) Data Preparation
+
+    Goal: Replace text tokenization with entity-based concept IDs plus simple adjacency-based relation extraction (via spaCy + offline knowledge if needed).
+    Implementation: We already have spacy_prepare_shakespeare.py, which outputs:
+        train.bin, val.bin: Sequences of concept IDs (i.e., an integer “vocabulary”).
+        meta.pkl: Contains stoi, itos, relation_stoi, relation_itos, plus vocab_size and relation_vocab_size.
+
+2) Model Architecture
+
+    Multi-Batch GPT:
+        Input shape: (B, T) of concept IDs.
+        Output shape: (B, vocab_size) concept probabilities from the last token, plus (B, T, relation_embd_dim) for relations.
+        A separate ReasoningState class can still exist if you want single-sample logic or offline rule-based transitions, but the actual model.forward(...) now expects concept ID tensors, not a ReasoningState.
+    Stateful Logic (Optional):
+        If you want to test transitions in a loop (like LCM steps), your training script can “unroll” multiple forward passes, or just build multi-step sequences in train.py and compare predictions at each step.
+
+3) Training Loop
+
+    Data Loader:
+        get_batch(split) returns a batch of shape (B, T) for concept IDs, plus (B, vocab_size) for concept targets (if you’re doing a next-concept-prediction or an action classification).
+        If you incorporate a “consistency step,” you can handle it in train.py by calling the model multiple times and enforcing consistency constraints.
+    Loss:
+        Typically binary_cross_entropy or cross_entropy (depending on how you frame the classification).
+        If you have “action” predictions, you’d do a cross-entropy over the 3 actions. If you have “concept presence” predictions, you do BCE across the vocab dimension.
+
+4) Next Steps
+
+    Evaluation:
+        At minimum, measure the difference between predicted concept IDs and “ground truth” from your rule-based transitions.
+        For a more advanced scenario, measure symbolic “consistency” across multiple steps.
+    Rule-based vs. Learned:
+        Compare model’s predictions to the rule-based transitions on a validation set to see how closely it’s learning the rules.
+    Refinement:
+        Potentially incorporate real KG queries (Wikidata), more advanced “reasoning,” or multi-step transitions with an LCM-like approach.
