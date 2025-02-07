@@ -5,3 +5,5 @@ tqdm
 requests
 tiktoken
 spacy
+ijson
+rdflib

@@ -1,138 +1,156 @@
 import os
 import pickle
-import subprocess
+import ijson  # For streaming JSON parsing
+import rdflib  # For N-Triples parsing
 import spacy
 import numpy as np
 from tqdm import tqdm
-from spacy.tokens import Span, Doc
+import requests  # For Wikidata SPARQL queries
+import bz2 #For handling bzip2 compression
 
-
-class OfflineWikidataKnowledgeGraph:
+def get_concept_qid(concept_name):
     """
-    Interface to an offline Wikidata subset (TSV format).
+    Queries Wikidata SPARQL endpoint to get QID from a label.
     """
-    def __init__(self, tsv_path):
-        self.data = {}  # Store triples: {subject: {predicate: [objects]}}
-        self.concept_ids = set() #Keep track of all concepts
-        self.relation_ids = set()
-        self.load_tsv(tsv_path)
-
-
-    def load_tsv(self, tsv_path):
-        """Loads the Wikidata subset from a TSV file."""
-        print(f"Loading Wikidata subset from {tsv_path}...")
-        # Check if file exists and is not empty
-        if not os.path.exists(tsv_path) or os.stat(tsv_path).st_size == 0:
-            print(f"Error: TSV file is empty or does not exist: {tsv_path}")
-            raise FileNotFoundError(f"TSV file is empty or missing: {tsv_path}")
-
-
-        with open(tsv_path, 'r', encoding='utf-8') as f:
-            next(f)  # Skip header line (subject predicate object)
-            for line in tqdm(f, desc="Loading TSV"):
-                try:
-                    subject, predicate, object_ = line.strip().split('\t')
-                    self.concept_ids.add(subject)
-                    self.relation_ids.add(predicate)
-                    self.concept_ids.add(object_)
-
-                    if subject not in self.data:
-                        self.data[subject] = {}
-                    if predicate not in self.data[subject]:
-                        self.data[subject][predicate] = []
-                    self.data[subject][predicate].append(object_)
-                except ValueError:
-                    print(f"Skipping invalid line: {line.strip()}") #Handle lines that do not have 3 values.
-
-        print(f"Loaded {len(self.data)} subjects, {len(self.concept_ids)} unique concepts, and {len(self.relation_ids)} relations.")
-
-    def get_concept_id(self, concept_name):
-        """
-        Placeholder: Returns the QID.
-        """
-        return concept_name  # Return the QID itself
-
-    def has_relation(self, concept_id1, concept_id2, relation_id=None):
-        """Checks if a relation exists between two concepts."""
-        if concept_id1 not in self.data:
-            return False
-        if relation_id is None:
-            # Check for *any* relation
-            for rel, objects in self.data[concept_id1].items():
-                if concept_id2 in objects:
-                    return True
-            return False
-        else:
-            #Check for the specific relation.
-            return (relation_id in self.data[concept_id1] and
-                    concept_id2 in self.data[concept_id1][relation_id])
-
-    def get_related_concepts(self, concept_id, relation_id=None, limit=None):
-        """Gets concepts related to a given concept."""
-        related_concepts = []
-        if concept_id in self.data:
-            if relation_id:
-                if relation_id in self.data[concept_id]:
-                    related_concepts.extend(self.data[concept_id][relation_id])
-            else:
-                # Get all related concepts
-                for rel, objects in self.data[concept_id].items():
-                    related_concepts.extend(objects)
-        if limit:
-            return related_concepts[:limit]
-        else:
-            return related_concepts
-
-    def get_relation_id(self, relation_name):
-        """
-        Placeholder
-        """
-        return relation_name
-
-
-
-def create_wikidata_subset(dump_file, output_tsv, qid_file, java_jar_path):
+    service = "https://query.wikidata.org/sparql"
+    query = f"""
+        SELECT ?concept WHERE {{
+            ?concept rdfs:label "{concept_name}"@en .
+        }} LIMIT 1
     """
-    Creates the Wikidata subset using the compiled Java program.
-    """
-    command = [
-        "java",
-        "-jar",  # Use -jar to execute the JAR file
-        java_jar_path,
-        dump_file,
-        output_tsv,
-        qid_file,
-    ]
-    print(f"Running Java command: {' '.join(command)}")
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-    except subprocess.CalledProcessError as e:
-        print(f"Error running Java command: {e}")
-        print(e.stderr)
-        exit(1)
-    except FileNotFoundError:
-        print("Error: Java not found.  Make sure Java is installed and in your PATH.")
-        exit(1)
+        response = requests.get(service, params={'query': query, 'format': 'json'}, timeout=10)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        data = response.json()
+        bindings = data.get("results", {}).get("bindings", [])
+        if bindings:
+            concept_uri = bindings[0]["concept"]["value"]
+            return concept_uri.split("/")[-1]  # Extract QID
+        return None
+    except requests.RequestException as e:
+        print(f"Error querying Wikidata for '{concept_name}': {e}")
+        return None
 
-def process_text_chunked(nlp, text, chunk_size=100000):
+def process_json_dump(dump_file, output_file, target_concepts):
     """
-    Processes text in chunks.
+    Processes a Wikidata JSON dump file, extracting triples and writing to a TSV.
     """
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        yield nlp(chunk)
+    print(f"Processing JSON dump: {dump_file}")
+    triple_count = 0
 
-def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, dataset_name="symbolic_shakespeare"):
-    qid_file = os.path.join(output_dir, "initial_qids.txt")
-    # Corrected path to the JAR file created by Maven
-    java_jar_path = os.path.join("wikidata", "wikidata-subset-creator.jar")
+    with open(output_file, 'w', encoding='utf-8') as out_file:
+        out_file.write("subject\tpredicate\tobject\n")  # TSV header
+
+        if dump_file.endswith(".bz2"):
+            file_open_func = bz2.open
+        else:
+            file_open_func = open
+
+        with file_open_func(dump_file, "rb") as f:  # Open as binary for ijson
+            # Use ijson.items with a prefix that gets us to each item document
+            for item in ijson.items(f, "item"):
+                if not isinstance(item, dict) or "id" not in item:
+                    continue  # Skip malformed items
+
+                subject_qid = item["id"]
+
+                if target_concepts and subject_qid not in target_concepts:
+                    continue
+
+                claims = item.get("claims", {})
+                for predicate, statements in claims.items():
+                    if not predicate.startswith("P"):
+                        continue  # Skip non-property claims
+                    for statement in statements:
+                        mainsnak = statement.get("mainsnak", {})
+                        datavalue = mainsnak.get("datavalue", {})
+                        if datavalue.get("type") == "wikibase-entityid":
+                            object_value = datavalue.get("value", {})
+                            object_qid = object_value.get("id")
+                            if object_qid and object_qid.startswith("Q"):
+                                out_file.write(f"{subject_qid}\t{predicate}\t{object_qid}\n")
+                                triple_count += 1
+                #Also add qids from labels
+                if "labels" in item:
+                    for lang, label_data in item["labels"].items():
+                        label_text = label_data.get("value")
+                        if label_text:
+                            new_qid = get_concept_qid(label_text)
+                            if new_qid:
+                                target_concepts.add(new_qid)
+
+    print(f"Finished processing JSON.  Wrote {triple_count} triples.")
+
+
+def process_nt_dump(dump_file, output_file, target_concepts):
+    """
+    Processes an N-Triples dump file, extracting triples and writing to a TSV.
+    """
+    print(f"Processing N-Triples dump: {dump_file}")
+    triple_count = 0
+
+    with open(output_file, 'w', encoding='utf-8') as out_file:
+        out_file.write("subject\tpredicate\tobject\n")
+
+        if dump_file.endswith(".bz2"):
+            file_open_func = bz2.open
+        else:
+            file_open_func = open
+
+        with file_open_func(dump_file, "rt", encoding="utf-8") as f:  # Open as text
+            # Iterate through lines (each line is an N-Triple)
+            for line in tqdm(f, desc="Processing N-Triples", unit="triple"):
+                line = line.strip()
+                if not line or line.startswith("#"):  # Skip comments and empty lines
+                    continue
+
+                try:
+                    # Basic N-Triples parsing (splitting on spaces, handling URIs)
+                    parts = line.split(" ", 2)  # Split into 3 parts (max)
+                    if len(parts) != 3:
+                        continue  # Skip malformed lines
+                    subject_uri = parts[0][1:-1]  # Remove < >
+                    predicate_uri = parts[1][1:-1]
+                    object_part = parts[2]
+
+                    # Extract QID/PID from URIs
+                    subject_qid = subject_uri.split("/")[-1]
+
+                    if target_concepts and subject_qid not in target_concepts:
+                        continue #Skip if qid not in our target
+
+                    predicate_pid = predicate_uri.split("/")[-1]
+
+                    if not predicate_pid.startswith("P"):
+                        continue
+
+                    # Handle object (which could be a URI or a literal)
+                    if object_part.startswith("<"):  # URI
+                        object_qid = object_part[1:-1].split("/")[-1] # Remove <>
+                        if object_qid.startswith("Q"): #Only save Q-number objects
+                            out_file.write(f"{subject_qid}\t{predicate_pid}\t{object_qid}\n")
+                            triple_count += 1
+
+                    # We don't process literal values.
+                except Exception as e:
+                    print(f"Error processing line: {line} - {e}") #Print the exception
+                    continue
+
+    print(f"Finished processing N-Triples. Wrote {triple_count} triples.")
+
+
+
+
+def prepare_symbolic_data(input_file, output_dir, wikidata_dump_path, dataset_name="symbolic_shakespeare"):
 
     # --- 0. Create Wikidata Subset (if it doesn't exist) ---
+    tsv_path = os.path.join(output_dir, 'wikidata_subset.tsv')
     if not os.path.exists(tsv_path):
         print(f"Wikidata subset file not found: {tsv_path}")
+
+        #Initial QID file:
+        qid_file = os.path.join(output_dir, "initial_qids.txt")
+
         # Initial QID extraction using spaCy (before KG subset exists)
         print("Performing initial NER with spaCy to generate qids.txt...")
         try:
@@ -149,26 +167,30 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
             text = f.read()
 
         initial_qids = set()
-         # Process in chunks for initial QID extraction
+        # Process in chunks for initial QID extraction
         for doc in process_text_chunked(nlp, text):
             for ent in doc.ents:
                 if ent.label_ in ("PERSON", "ORG", "GPE", "LOC", "PRODUCT", "WORK_OF_ART", "EVENT", "NORP"):
-                    initial_qids.add("Q" + ent.text.replace(" ", "_").replace("'", "")) #Basic QID creation
+                    initial_qids.add("Q" + ent.text.replace(" ", "_").replace("'", ""))  # Basic QID creation
 
         with open(qid_file, "w", encoding="utf-8") as f:
             for qid in initial_qids:
                 f.write(qid + "\n")
         print(f"Initial QIDs written to {qid_file}")
 
-        create_wikidata_subset(wikidata_dump_path, tsv_path, qid_file, java_jar_path)
 
+        # Determine dump file type and process accordingly
+        if wikidata_dump_path.endswith(('.json', '.json.bz2')):
+            process_json_dump(wikidata_dump_path, tsv_path, initial_qids)
+        elif wikidata_dump_path.endswith(('.nt', '.nt.bz2')):
+            process_nt_dump(wikidata_dump_path, tsv_path, initial_qids)
+        else:
+            print(f"Unsupported dump file type: {wikidata_dump_path}")
+            exit(1)
 
     # --- 1. Load Offline Wikidata Knowledge Graph ---
-    try:
-        knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path)
-    except FileNotFoundError as e:
-        print(f"Error: {e}.  Could not load Wikidata subset. Please check the file path and ensure the subset creation was successful.")
-        exit(1)
+    print(f"Loading Wikidata subset from {tsv_path}...")
+    knowledge_graph = OfflineWikidataKnowledgeGraph(tsv_path) #Use our KG class
 
     # --- 2. Load spaCy Model (and download if necessary) ---
     try:
@@ -245,11 +267,28 @@ def prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, 
     print(f"Validation data size: {len(val_data)}")
     print(f"Saved metadata to {os.path.join(output_dir, 'meta.pkl')}")
 
+
+
+def process_text_chunked(nlp, text, chunk_size=100000):
+    """
+    Processes text in chunks using spaCy, yielding Doc objects for each chunk.
+
+    Args:
+        nlp: The loaded spaCy language model.
+        text: The full text to process.
+        chunk_size: The size of each chunk (in characters).
+
+    Yields:
+        spaCy Doc objects for each processed chunk.
+    """
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i + chunk_size]
+        yield nlp(chunk)
+
 if __name__ == '__main__':
     input_file = 'data/shakespeare/input.txt'
     output_dir = 'data/symbolic_shakespeare'
-    tsv_path = os.path.join(output_dir, 'wikidata_subset.tsv')  # Output TSV
     wikidata_dump_path = 'wikidata/latest-truthy.nt.bz2' #Path
 
     os.makedirs(output_dir, exist_ok=True)
-    prepare_symbolic_data(input_file, output_dir, tsv_path, wikidata_dump_path, dataset_name="symbolic_shakespeare")
+    prepare_symbolic_data(input_file, output_dir,  wikidata_dump_path, dataset_name="symbolic_shakespeare") #tsv_path removed
